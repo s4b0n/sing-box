@@ -2,6 +2,7 @@ package dialer
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 
@@ -149,32 +150,59 @@ func NewDefault(router adapter.Router, options option.DialerOptions) (*DefaultDi
 	}, nil
 }
 
+func dialContextWithRetry(dialer net.Dialer, ctx context.Context, network string, destination string) (net.Conn, error) {
+	var err error
+	for i := 0; i < 4; i++ {
+		var conn net.Conn
+		var thisErr error
+		conn, thisErr = dialer.DialContext(ctx, network, destination)
+		if thisErr == nil {
+			return conn, nil
+		}
+		if !errors.Is(thisErr, context.DeadlineExceeded) || err == nil {
+			err = thisErr
+		}
+		if errors.Is(thisErr, context.DeadlineExceeded) {
+			break
+		}
+	}
+	return nil, err
+}
+
 func (d *DefaultDialer) DialContext(ctx context.Context, network string, address M.Socksaddr) (net.Conn, error) {
 	if !address.IsValid() {
 		return nil, E.New("invalid address")
 	}
-	switch N.NetworkName(network) {
-	case N.NetworkUDP:
+	if N.NetworkName(network) == N.NetworkUDP {
 		if !address.IsIPv6() {
-			return trackConn(d.udpDialer4.DialContext(ctx, network, address.String()))
-		} else {
-			return trackConn(d.udpDialer6.DialContext(ctx, network, address.String()))
+			return dialContextWithRetry(d.udpDialer4, ctx, network, address.String())
+		}
+		return dialContextWithRetry(d.udpDialer6, ctx, network, address.String())
+	} else if !address.IsIPv6() {
+		return trackConn(DialSlowContext(&d.dialer4, ctx, network, address))
+	}
+	return trackConn(DialSlowContext(&d.dialer6, ctx, network, address))
+}
+
+func listenPacketWithRetry(listener net.ListenConfig, ctx context.Context, network string, address string) (net.PacketConn, error) {
+	var err error
+	for i := 0; i < 4; i++ {
+		var conn net.PacketConn
+		conn, err = listener.ListenPacket(ctx, network, address)
+		if err == nil {
+			return conn, nil
 		}
 	}
-	if !address.IsIPv6() {
-		return trackConn(DialSlowContext(&d.dialer4, ctx, network, address))
-	} else {
-		return trackConn(DialSlowContext(&d.dialer6, ctx, network, address))
-	}
+	return nil, err
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if destination.IsIPv6() {
-		return trackPacketConn(d.udpListener.ListenPacket(ctx, N.NetworkUDP, d.udpAddr6))
+		return trackPacketConn(listenPacketWithRetry(d.udpListener, ctx, N.NetworkUDP, d.udpAddr6))
 	} else if destination.IsIPv4() && !destination.Addr.IsUnspecified() {
-		return trackPacketConn(d.udpListener.ListenPacket(ctx, N.NetworkUDP+"4", d.udpAddr4))
+		return trackPacketConn(listenPacketWithRetry(d.udpListener, ctx, N.NetworkUDP+"4", d.udpAddr4))
 	} else {
-		return trackPacketConn(d.udpListener.ListenPacket(ctx, N.NetworkUDP, d.udpAddr4))
+		return trackPacketConn(listenPacketWithRetry(d.udpListener, ctx, N.NetworkUDP, d.udpAddr4))
 	}
 }
 
