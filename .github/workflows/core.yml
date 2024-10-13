@@ -1,0 +1,99 @@
+name: Build Core
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{steps.go.outputs.version}}
+    steps:
+      - name: get latest go version
+        id: go
+        run: |
+          echo version=$(curl -s https://raw.githubusercontent.com/actions/go-versions/update-versions-manifest-file/versions-manifest.json | grep -oE '"version": "[0-9]{1}.[0-9]{1,}(.[0-9]{1,})?"' | head -1 | cut -d':' -f2 | sed 's/ //g; s/"//g') >> $GITHUB_OUTPUT
+
+  sing-box:
+    runs-on: ubuntu-latest
+    needs: go
+    outputs:
+      version: ${{steps.sing-box.outputs.version}}
+    steps:
+      - uses: actions/checkout@v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: setup go
+        uses: actions/setup-go@v5.0.0
+        with:
+          go-version: ${{needs.go.outputs.version}}
+
+      - name: set env
+        run: |
+          git remote add upstream https://github.com/SagerNet/sing-box.git
+          git fetch --tags --force upstream
+          if [ "${{ github.ref_name }}" == "dev-next" ]; then
+            TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
+          else
+            TAG=$(git describe --tags --abbrev=0)
+          fi
+          REV=$(git rev-parse --short HEAD)
+          echo "BUILDTIME=$(TZ=Asia/Shanghai date)"
+          echo "NAME=${{matrix.jobs.goos}}-${{matrix.jobs.output}}" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "REV=$REV" >> $GITHUB_ENV
+          echo "VERSION=${TAG}-${REV}" >> $GITHUB_ENV
+          echo "CGO_ENABLED=0" >> $GITHUB_ENV
+          echo "BUILDTAG=-extldflags -static" >> $GITHUB_ENV
+        shell: bash
+
+  build-android:
+    runs-on: ubuntu-latest
+    needs:
+      - go
+      - sing-box
+    strategy:
+      matrix:
+        jobs:
+          - { goarch: arm, ndk: armv7a-linux-androideabi34, output: armeabi-v7a }
+          - { goarch: arm64, ndk: aarch64-linux-android34, output: arm64-v8a }
+    env:
+      VERSION: ${{needs.sing-box.outputs.version}}
+    steps:
+      - uses: actions/checkout@v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: setup go
+        uses: actions/setup-go@v5.0.0
+        with:
+          go-version: ${{needs.go.outputs.version}}
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27
+          add-to-path: false
+          local-cache: false
+
+      - name: build core
+        env:
+          CC: ${{steps.setup-ndk.outputs.ndk-path}}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{matrix.jobs.ndk}}-clang
+          TAGS: with_quic,with_gvisor,with_utls,with_clash_api
+          GOOS: android
+          GOARM: '7'
+          GOARCH: ${{matrix.jobs.goarch}}
+          CGO_ENABLED: '1'
+        run: go build -v -trimpath -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' -s -w -buildid=" -tags "${TAGS}" ./cmd/sing-box
+
+      - name: upload core
+        uses: actions/upload-artifact@v4.1.0
+        with:
+          name: sing-box-${{env.VERSION}}-android-${{matrix.jobs.output}}
+          path: |
+            sing-box
+            sing-box-${{env.VERSION}}-android-${{matrix.jobs.output}}.tag
+          compression-level: 9
